@@ -1,6 +1,21 @@
+# Virtual Environment - Covers multiple common names
 .venv/
+venv/
+ENV/
+env/
+
+# Python cache files
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Environment variables file
+.env
+
+# VS Code editor settings
+.vscode/
+
+# Project-specific files to ignore (from your file - EXCELLENT!)
 movies.csv
 service-account.json
-.env
