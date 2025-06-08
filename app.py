@@ -1,5 +1,5 @@
 # --------------------------------------------------------------------------
-# app.py (v1.2 - More flexible and intelligent classification)
+# app.py (v1.8 - Comedy fix and Debug Endpoint)
 # --------------------------------------------------------------------------
 
 import os
@@ -23,7 +23,7 @@ load_dotenv()
 app = FastAPI(
     title="Movie Recommendation Chatbot API",
     description="An API for a chatbot that recommends movies based on various criteria.",
-    version="1.2.0"
+    version="1.8.0"
 )
 app.add_middleware(
     CORSMiddleware,
@@ -127,6 +127,16 @@ def load_and_process_data():
 def contains_arabic(text: str) -> bool:
     return bool(re.search(r'[\u0600-\u06FF]', text))
 
+def search_by_keyword(keyword: str) -> pd.DataFrame:
+    df = app_state.df
+    keyword_lower = keyword.lower()
+    title_mask = df['name'].str.contains(keyword_lower, case=False, na=False)
+    cast_mask = df['cast'].apply(lambda cast_list: any(keyword_lower in str(actor).lower() for actor in cast_list) if isinstance(cast_list, list) else False)
+    director_mask = df['crew'].apply(lambda crew_dict: keyword_lower in str(crew_dict.get('director', '')).lower() if isinstance(crew_dict, dict) else False)
+    combined_mask = title_mask | cast_mask | director_mask
+    results = df[combined_mask]
+    return results.sort_values(by=['rating', 'release_date'], ascending=[False, False])
+
 def recommend_by_genre(genre: str) -> pd.DataFrame:
     df = app_state.df
     genre_mapping = { "sci-fi": "Science Fiction", "science fiction": "Science Fiction"}
@@ -135,26 +145,13 @@ def recommend_by_genre(genre: str) -> pd.DataFrame:
     return matches.sort_values(by=['rating', 'release_date'], ascending=[False, False]).head(5)
 
 def recommend_by_actor(actor: str) -> pd.DataFrame:
-    df = app_state.df
-    return df[df['cast'].apply(lambda cast_list: actor.lower() in [str(a).lower() for a in cast_list] if isinstance(cast_list, list) else False)]\
-        .sort_values(by=['rating', 'release_date'], ascending=[False, False]).head(5)
+    return search_by_keyword(actor)
 
 def recommend_by_director(director: str) -> pd.DataFrame:
-    df = app_state.df
-    return df[df['crew'].apply(lambda x: director.lower() in str(x.get('director', '')).lower() if isinstance(x, dict) else False)]\
-        .sort_values(by=['rating', 'release_date'], ascending=[False, False]).head(5)
+    return search_by_keyword(director)
 
 def recommend_similar_movies(movie_title: str) -> pd.DataFrame:
-    df = app_state.df
-    # البحث باستخدام str.contains ليكون أكثر مرونة
-    matches = df[df['name'].str.lower() == movie_title.lower()]
-    if matches.empty:
-        return pd.DataFrame()
-    
-    idx = matches.index[0]
-    cosine_sim = cosine_similarity(app_state.tfidf_matrix[idx], app_state.tfidf_matrix).flatten()
-    indices = cosine_sim.argsort()[-6:-1][::-1]
-    return df.iloc[indices]
+    return search_by_keyword(movie_title)
 
 def format_recommendations(recs_df: pd.DataFrame) -> List[dict]:
     if recs_df.empty:
@@ -168,56 +165,33 @@ def format_recommendations(recs_df: pd.DataFrame) -> List[dict]:
     recs_df_filtered = recs_df[[col for col in output_columns if col in recs_df.columns]]
     return recs_df_filtered.to_dict(orient='records')
 
-
-# --------------------------------------------------------------------------
-# (## تعديل رئيسي هنا ##): دالة التصنيف الجديدة والأكثر ذكاءً
-# --------------------------------------------------------------------------
 def classify_input(user_input: str) -> Tuple[str, Optional[str]]:
-    """
-    Classifies user input by extracting keywords with priority:
-    1. Movie Titles
-    2. Actors / Directors
-    3. Genres
-    4. Conversational keywords
-    """
     user_input_lower = user_input.lower().strip()
-
-    # الأولوية 1: البحث عن اسم فيلم مذكور في الجملة
     for title in app_state.all_titles_lower:
-        # استخدام `\b` للتأكد من مطابقة الكلمة كاملة
         if re.search(r'\b' + re.escape(title) + r'\b', user_input_lower):
-             # استرجاع الاسم الأصلي للفيلم
             original_title = next((t for t in app_state.df['name'] if t.lower() == title), title)
             return "similar_movie", original_title
-
-    # الأولوية 2: البحث عن اسم ممثل أو مخرج
     for actor in app_state.all_actors_lower:
         if re.search(r'\b' + re.escape(actor) + r'\b', user_input_lower):
             return "actor", actor.title()
-            
     for director in app_state.all_directors_lower:
         if re.search(r'\b' + re.escape(director) + r'\b', user_input_lower):
             return "director", director.title()
-
-    # الأولوية 3: البحث عن نوع الفيلم
+    
+    # (## تعديل هنا ##): جعل البحث عن النوع أكثر مرونة
     genre_keywords = {"action", "comedy", "drama", "science fiction", "sci-fi", "superhero", "animation", "sports", "war", "thriller"}
     for genre in genre_keywords:
-        if re.search(r'\b' + re.escape(genre) + r'\b', user_input_lower):
+        if genre in user_input_lower:
             return "genre", genre
 
-    # الأولوية 4: الكلمات الحوارية
     thank_yous = {"thank you", "thanks", "thx", "thank u"}
     if any(word in user_input_lower for word in thank_yous):
         return "thank_you", None
-    
     greetings = {"hello", "hi", "hey"}
     help_requests = {"help", "can you help", "what can you do", "recommend a movie"}
     if any(word in user_input_lower for word in greetings | help_requests):
         return "greeting_or_help", None
-
-    # إذا لم يتم العثور على أي شيء
     return "unknown", user_input
-
 
 def get_bot_response(user_input: str) -> dict:
     if contains_arabic(user_input):
@@ -237,20 +211,21 @@ def get_bot_response(user_input: str) -> dict:
         bot_message = f"Looking for {value} movies? Here are some great ones:"
         recs_df = recommend_by_genre(value)
     elif label == "actor":
-        bot_message = f"You got it! Here are some popular movies starring '{value}':"
+        bot_message = f"You got it! Here are all movies I found related to '{value}':"
         recs_df = recommend_by_actor(value)
     elif label == "director":
-        bot_message = f"Of course! Here are some popular movies directed by '{value}':"
+        bot_message = f"Of course! Here are all movies I found related to '{value}':"
         recs_df = recommend_by_director(value)
     elif label == "similar_movie":
-        bot_message = f"If you liked '{value}', you might also enjoy these:"
+        bot_message = f"I found these results for the movie '{value}':"
         recs_df = recommend_similar_movies(value)
-    else:
-        bot_message = f"Sorry, I couldn't find anything for '{user_input}'. Please try a different movie, genre, actor, or director."
+    else: # unknown
+        bot_message = f"I couldn't recognize a specific request, so here is a general search for '{user_input}':"
+        recs_df = search_by_keyword(user_input)
 
     formatted_recs = format_recommendations(recs_df)
-    if not formatted_recs and label not in ["greeting_or_help", "thank_you", "unknown"]:
-        bot_message = f"Sorry, no movies found for '{value}'. Please try something else."
+    if not formatted_recs and label not in ["greeting_or_help", "thank_you"]:
+        bot_message = f"Sorry, no movies found matching '{value or user_input}'. Please try something else."
             
     return {"bot": bot_message, "recommendations": formatted_recs}
 
@@ -259,10 +234,20 @@ def get_bot_response(user_input: str) -> dict:
 @app.on_event("startup")
 def on_startup():
     load_and_process_data()
-
 @app.get("/", response_model=RootResponse, tags=["General"])
 def root():
     return { "message": "Welcome to the Movie Recommendation API!", "documentation_url": "/docs" }
+
+# (## إضافة جديدة ##): نقطة نهاية مؤقتة لتصحيح الأخطاء
+@app.get("/debug-categories", tags=["Debugging"])
+def get_debug_categories():
+    """Returns a list of unique, cleaned movie categories from the DataFrame."""
+    if app_state.df is None or 'category' not in app_state.df.columns:
+        return {"error": "No data loaded or category column missing."}
+    
+    unique_categories = app_state.df['category'].unique().tolist()
+    return {"unique_cleaned_categories": unique_categories}
+
 
 @app.post("/recommend", response_model=ChatResponse, tags=["Chatbot"])
 def recommend(request: ChatRequest):
