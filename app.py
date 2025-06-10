@@ -1,5 +1,5 @@
 # --------------------------------------------------------------------------
-# app.py (v1.8 - Comedy fix and Debug Endpoint)
+# app.py (v2.6 - Genre-Based Similarity)
 # --------------------------------------------------------------------------
 
 import os
@@ -8,8 +8,6 @@ import re
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -23,7 +21,7 @@ load_dotenv()
 app = FastAPI(
     title="Movie Recommendation Chatbot API",
     description="An API for a chatbot that recommends movies based on various criteria.",
-    version="1.8.0"
+    version="2.6.0"
 )
 app.add_middleware(
     CORSMiddleware,
@@ -53,8 +51,6 @@ class RootResponse(BaseModel):
 # --- 3. آلية التخزين المؤقت (Caching) ---
 class AppState:
     df: pd.DataFrame = None
-    tfidf_matrix = None
-    tfidf_vectorizer = None
     all_titles_lower: set = set()
     all_actors_lower: set = set()
     all_directors_lower: set = set()
@@ -68,8 +64,8 @@ try:
     if not firebase_credentials:
         raise ValueError("FIREBASE_CREDENTIALS environment variable not set.")
     cred_dict = json.loads(firebase_credentials)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(credentials.Certificate(cred_dict))
     db = firestore.client()
     print("✅ Firebase initialized successfully.")
 except Exception as e:
@@ -108,34 +104,33 @@ def load_and_process_data():
     df['category'] = df['category'].astype(str).str.strip().str.capitalize()
     df.dropna(subset=['release_date', 'category'], inplace=True)
     df = df[df['category'] != '']
-    df['combined_features'] = (
-        df['category'].fillna('') + ' ' +
-        df['description'].fillna('') + ' ' +
-        df['crew'].apply(lambda x: x.get('director', '') if isinstance(x, dict) else '').fillna('')
-    )
-    app_state.tfidf_vectorizer = TfidfVectorizer(stop_words='english')
-    app_state.tfidf_matrix = app_state.tfidf_vectorizer.fit_transform(df['combined_features'])
     app_state.df = df
     app_state.all_titles_lower = {str(title).lower() for title in df['name'].dropna()}
-    app_state.all_actors_lower = {str(actor).lower() for sublist in df['cast'].dropna() if isinstance(sublist, list) for actor in sublist}
-    app_state.all_directors_lower = {str(crew.get('director', '')).lower() for crew in df['crew'].dropna() if isinstance(crew, dict) and crew.get('director')}
+    app_state.all_actors_lower = {str(actor).lower().strip() for sublist in df['cast'].dropna() if isinstance(sublist, list) for actor in sublist}
+    app_state.all_directors_lower = {str(crew.get('director', '')).lower().strip() for crew in df['crew'].dropna() if isinstance(crew, dict) and crew.get('director')}
     app_state.last_fetch_time = now
-    print("✅ Data loaded, processed, and cached successfully.")
+    print("✅ Data loaded and cached successfully.")
 
 # --- 6. دوال منطق الشات بوت والتوصية ---
 
 def contains_arabic(text: str) -> bool:
     return bool(re.search(r'[\u0600-\u06FF]', text))
 
-def search_by_keyword(keyword: str) -> pd.DataFrame:
+def recommend_by_actor(actor_name: str) -> pd.DataFrame:
     df = app_state.df
-    keyword_lower = keyword.lower()
-    title_mask = df['name'].str.contains(keyword_lower, case=False, na=False)
-    cast_mask = df['cast'].apply(lambda cast_list: any(keyword_lower in str(actor).lower() for actor in cast_list) if isinstance(cast_list, list) else False)
-    director_mask = df['crew'].apply(lambda crew_dict: keyword_lower in str(crew_dict.get('director', '')).lower() if isinstance(crew_dict, dict) else False)
-    combined_mask = title_mask | cast_mask | director_mask
-    results = df[combined_mask]
-    return results.sort_values(by=['rating', 'release_date'], ascending=[False, False])
+    actor_lower = actor_name.lower()
+    mask = df['cast'].apply(
+        lambda cast_list: any(actor_lower == str(actor).lower().strip() for actor in cast_list) if isinstance(cast_list, list) else False
+    )
+    return df[mask].sort_values(by=['rating', 'release_date'], ascending=[False, False])
+
+def recommend_by_director(director_name: str) -> pd.DataFrame:
+    df = app_state.df
+    director_lower = director_name.lower()
+    mask = df['crew'].apply(
+        lambda crew_dict: director_lower == str(crew_dict.get('director', '')).lower().strip() if isinstance(crew_dict, dict) else False
+    )
+    return df[mask].sort_values(by=['rating', 'release_date'], ascending=[False, False])
 
 def recommend_by_genre(genre: str) -> pd.DataFrame:
     df = app_state.df
@@ -144,18 +139,32 @@ def recommend_by_genre(genre: str) -> pd.DataFrame:
     matches = df[df['category'].str.lower() == standard_genre.lower()]
     return matches.sort_values(by=['rating', 'release_date'], ascending=[False, False]).head(5)
 
-def recommend_by_actor(actor: str) -> pd.DataFrame:
-    return search_by_keyword(actor)
+# (## تعديل جذري هنا ##): دالة جديدة للتوصية بناء على تصنيف فيلم آخر
+def recommend_by_same_genre_as_movie(movie_title: str) -> pd.DataFrame:
+    df = app_state.df
+    movie_title_lower = movie_title.lower()
+    
+    # 1. البحث عن الفيلم المستهدف
+    target_movie = df[df['name'].str.lower() == movie_title_lower]
+    
+    # التأكد من العثور على الفيلم
+    if target_movie.empty:
+        return pd.DataFrame() # إرجاع جدول فارغ إذا لم يتم العثور على الفيلم
+    
+    # 2. استخراج التصنيف
+    target_category = target_movie['category'].iloc[0]
+    
+    # 3. الحصول على أفلام من نفس التصنيف
+    recommendations = recommend_by_genre(target_category)
+    
+    # 4. إزالة الفيلم الأصلي من قائمة التوصيات
+    final_recommendations = recommendations[recommendations['name'].str.lower() != movie_title_lower]
+    
+    return final_recommendations
 
-def recommend_by_director(director: str) -> pd.DataFrame:
-    return search_by_keyword(director)
-
-def recommend_similar_movies(movie_title: str) -> pd.DataFrame:
-    return search_by_keyword(movie_title)
 
 def format_recommendations(recs_df: pd.DataFrame) -> List[dict]:
-    if recs_df.empty:
-        return []
+    if recs_df.empty: return []
     recs_df = recs_df.copy()
     recs_df['release_year'] = recs_df['release_date'].dt.year
     recs_df['director'] = recs_df['crew'].apply(lambda x: x.get('director', 'Unknown') if isinstance(x, dict) else 'Unknown')
@@ -167,30 +176,55 @@ def format_recommendations(recs_df: pd.DataFrame) -> List[dict]:
 
 def classify_input(user_input: str) -> Tuple[str, Optional[str]]:
     user_input_lower = user_input.lower().strip()
-    for title in app_state.all_titles_lower:
-        if re.search(r'\b' + re.escape(title) + r'\b', user_input_lower):
-            original_title = next((t for t in app_state.df['name'] if t.lower() == title), title)
-            return "similar_movie", original_title
-    for actor in app_state.all_actors_lower:
-        if re.search(r'\b' + re.escape(actor) + r'\b', user_input_lower):
-            return "actor", actor.title()
-    for director in app_state.all_directors_lower:
-        if re.search(r'\b' + re.escape(director) + r'\b', user_input_lower):
-            return "director", director.title()
     
-    # (## تعديل هنا ##): جعل البحث عن النوع أكثر مرونة
+    # إضافة كلمات مفتاحية جديدة للبحث عن أفلام مشابهة
+    similarity_triggers = {"similar to", "like"}
+    
+    # التحقق من نية البحث عن فيلم مشابه أولاً
+    if any(trigger in user_input_lower for trigger in similarity_triggers):
+        # محاولة استخلاص اسم الفيلم بعد الكلمة المفتاحية
+        for trigger in similarity_triggers:
+            if trigger in user_input_lower:
+                # تقسيم الجملة عند الكلمة المفتاحية وأخذ ما بعدها
+                potential_title = user_input_lower.split(trigger, 1)[1].strip()
+                # البحث عن هذا العنوان في قائمة الأفلام المعروفة
+                for title in app_state.all_titles_lower:
+                    if title == potential_title:
+                        original_title = next((t for t in app_state.df['name'] if t.lower() == title), title)
+                        return "similar_movie_search", original_title
+
+    actor_triggers = {"actor", "starring", "acted in", "movies with", "by actor"}
+    if any(trigger in user_input_lower for trigger in actor_triggers):
+        found_actors = [actor for actor in app_state.all_actors_lower if re.search(r'\b' + re.escape(actor) + r'\b', user_input_lower)]
+        if found_actors:
+            longest_match = max(found_actors, key=len)
+            return "actor_search", longest_match.title()
+        else:
+            return "actor_not_found", user_input
+
+    director_triggers = {"directed by", "director", "by director"}
+    if any(trigger in user_input_lower for trigger in director_triggers):
+        found_directors = [director for director in app_state.all_directors_lower if re.search(r'\b' + re.escape(director) + r'\b', user_input_lower)]
+        if found_directors:
+            longest_match = max(found_directors, key=len)
+            return "director_search", longest_match.title()
+        else:
+            return "director_not_found", user_input
+            
     genre_keywords = {"action", "comedy", "drama", "science fiction", "sci-fi", "superhero", "animation", "sports", "war", "thriller"}
     for genre in genre_keywords:
-        if genre in user_input_lower:
+        if re.search(r'\b' + re.escape(genre) + r'\b', user_input_lower):
             return "genre", genre
 
     thank_yous = {"thank you", "thanks", "thx", "thank u"}
     if any(word in user_input_lower for word in thank_yous):
         return "thank_you", None
+        
     greetings = {"hello", "hi", "hey"}
     help_requests = {"help", "can you help", "what can you do", "recommend a movie"}
     if any(word in user_input_lower for word in greetings | help_requests):
         return "greeting_or_help", None
+        
     return "unknown", user_input
 
 def get_bot_response(user_input: str) -> dict:
@@ -204,28 +238,36 @@ def get_bot_response(user_input: str) -> dict:
     recs_df = pd.DataFrame()
 
     if label == "greeting_or_help":
-        bot_message = "Hello! I can recommend movies. What are you in the mood for? Try a genre, actor, or movie title."
+        bot_message = "Hello! I can recommend movies."
     elif label == "thank_you":
-        bot_message = "You're welcome! Is there anything else I can help with?"
+        bot_message = "You're welcome!"
     elif label == "genre":
         bot_message = f"Looking for {value} movies? Here are some great ones:"
         recs_df = recommend_by_genre(value)
-    elif label == "actor":
-        bot_message = f"You got it! Here are all movies I found related to '{value}':"
+    elif label == "actor_search":
+        bot_message = f"You got it! Here are movies starring '{value}':"
         recs_df = recommend_by_actor(value)
-    elif label == "director":
-        bot_message = f"Of course! Here are all movies I found related to '{value}':"
+    elif label == "director_search":
+        bot_message = f"Of course! Here are movies directed by '{value}':"
         recs_df = recommend_by_director(value)
-    elif label == "similar_movie":
-        bot_message = f"I found these results for the movie '{value}':"
-        recs_df = recommend_similar_movies(value)
-    else: # unknown
-        bot_message = f"I couldn't recognize a specific request, so here is a general search for '{user_input}':"
-        recs_df = search_by_keyword(user_input)
+    # (## تعديل هنا ##): إضافة حالة جديدة للبحث عن أفلام مشابهة
+    elif label == "similar_movie_search":
+        bot_message = f"If you liked '{value}', you might also enjoy these movies from the same genre:"
+        recs_df = recommend_by_same_genre_as_movie(value)
+    elif label == "actor_not_found":
+        bot_message = "Sorry, I couldn't find a matching actor in the database. Please check the spelling."
+    elif label == "director_not_found":
+        bot_message = "Sorry, I couldn't find a matching director in the database. Please check the spelling."
+    else: # label == "unknown"
+        bot_message = f"I see you're asking about '{user_input}'. To give you the best results, could you please be more specific? For example, try 'movies starring {user_input}'."
+        recs_df = pd.DataFrame()
 
     formatted_recs = format_recommendations(recs_df)
-    if not formatted_recs and label not in ["greeting_or_help", "thank_you"]:
-        bot_message = f"Sorry, no movies found matching '{value or user_input}'. Please try something else."
+    
+    if not formatted_recs and label in ["actor_search", "director_search", "similar_movie_search"]:
+        bot_message = f"I found '{value}' in my database, but it seems there are no available movies for this request at the moment."
+    elif not formatted_recs and label == "genre":
+        bot_message = f"Sorry, no movies found for the genre '{value}'. Please try something else."
             
     return {"bot": bot_message, "recommendations": formatted_recs}
 
@@ -237,18 +279,6 @@ def on_startup():
 @app.get("/", response_model=RootResponse, tags=["General"])
 def root():
     return { "message": "Welcome to the Movie Recommendation API!", "documentation_url": "/docs" }
-
-# (## إضافة جديدة ##): نقطة نهاية مؤقتة لتصحيح الأخطاء
-@app.get("/debug-categories", tags=["Debugging"])
-def get_debug_categories():
-    """Returns a list of unique, cleaned movie categories from the DataFrame."""
-    if app_state.df is None or 'category' not in app_state.df.columns:
-        return {"error": "No data loaded or category column missing."}
-    
-    unique_categories = app_state.df['category'].unique().tolist()
-    return {"unique_cleaned_categories": unique_categories}
-
-
 @app.post("/recommend", response_model=ChatResponse, tags=["Chatbot"])
 def recommend(request: ChatRequest):
     if app_state.df is None:
